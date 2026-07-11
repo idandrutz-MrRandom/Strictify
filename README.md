@@ -21,6 +21,7 @@ Get an API key for the model and insert the api key and the model name in the re
 Q: Wait... WHY DOESNT IT WORK!?!?!
 A: Make sure your games https is turned on.
 
+Any bugs? Dm idan4k on discord to discuss.
 
 
 https://github.com/user-attachments/assets/8f52f8eb-1626-4621-8515-a2df2f813a2c
