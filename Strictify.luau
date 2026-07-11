@@ -1,0 +1,1844 @@
+--!strict
+--[[
+	PrettierAI (NVIDIA NIM edition) — tidies up Luau formatting and adds
+	strict type annotations, backed by a single NVIDIA NIM model.
+
+	------------------------------------------------------------------------
+	LICENSE & ATTRIBUTION:
+	Copyright 2026 Idan D Drutz - MrRandom (https://github.com/idandrutz-MrRandom)
+
+	Licensed under the Apache License, Version 2.0 (the "License");
+	you may not use this file except in compliance with the License.
+	You may obtain a copy of the License at
+
+		http://www.apache.org/licenses/LICENSE-2.0
+
+	Unless required by applicable law or agreed to in writing, software
+	distributed under the License is distributed on an "AS IS" BASIS,
+	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+	See the License for the specific language governing permissions and
+	limitations under the License.
+	------------------------------------------------------------------------
+	DONATIONS:
+	If you find this plugin helpful and want to support its ongoing 
+	development, any donations are highly appreciated!
+	------------------------------------------------------------------------
+
+	ACTIONS (always available, no setup):
+	  - "Format Line"   toolbar button / bindable Plugin Action
+	  - "Format Script" toolbar button / bindable Plugin Action
+	  To bind a keyboard shortcut to either: File -> Advanced -> Customize
+	  Shortcuts, search "PrettierAI", assign a key. Roblox doesn't give
+	  plugins any way to do this from script, so that dialog is the only
+	  place real OS-level keybinds are configured.
+
+	TEXT TRIGGERS (this IS configurable from the settings panel below):
+	  - Quick-Format Trigger — type your configured suffix (default ',,') at
+	    the end of a line to format just that line.
+	  - Inline Generation Trigger — type your configured prefix followed by
+	    parentheses (default 'local players: { Player } = Players:GetPlayers() to generate a snippet from a prompt.
+	  - Auto-Correct on Enter — optionally format the line you just finished
+	    every time you press Enter.
+	  Each of these has its own ON/OFF toggle, and the trigger strings
+	  themselves are editable text fields, in the settings panel.
+
+	SAFETY (unchanged from the version that's been working):
+	- Every write re-verifies the target text hasn't changed since it was
+	  read, and aborts instead of overwriting anything newer.
+	- AI output is validated before being applied (isSafeLineReplacement).
+	- Concurrency locks prevent overlapping requests/edits from racing.
+	- Transient errors (rate limits, timeouts) retry with backoff.
+]]
+
+type TextPosition = {
+	line: number,
+	character: number,
+}
+
+type TextRange = {
+	start: TextPosition,
+	["end"]: TextPosition,
+}
+
+type DocumentChange = {
+	range: TextRange,
+	text: string,
+}
+
+type TableInfo = {
+	lineNum: number,
+	kind: string,
+	keyType: string?,
+	valueType: string?,
+	elemType: string?,
+	rawLine: string,
+}
+
+type TableUsage = {
+	keys: { [string]: boolean },
+	values: { [string]: boolean },
+	elements: { [string]: boolean },
+	hasArrayInsert: boolean,
+	hasDictAssign: boolean,
+}
+
+local HttpService: HttpService = game:GetService("HttpService")
+local ScriptEditorService: ScriptEditorService = game:GetService("ScriptEditorService")
+local StudioService: StudioService = game:GetService("StudioService")
+local Selection: Selection = game:GetService("Selection")
+local ChangeHistoryService: ChangeHistoryService = game:GetService("ChangeHistoryService")
+
+local NVIDIA_LABEL = "NVIDIA NIM"
+local NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+local NVIDIA_API_KEY_SETTING = "PrettierAI_NvidiaKey"
+local NVIDIA_MODEL_SETTING = "PrettierAI_NvidiaModel"
+local DEFAULT_NVIDIA_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
+
+local QUICK_TRIGGER_ENABLED_KEY = "PrettierAI_QuickTriggerEnabled"
+local QUICK_TRIGGER_STRING_KEY = "PrettierAI_QuickTriggerString"
+local DEFAULT_QUICK_TRIGGER = ",,"
+
+local INLINE_TRIGGER_ENABLED_KEY = "PrettierAI_InlineTriggerEnabled"
+local INLINE_TRIGGER_PREFIX_KEY = "PrettierAI_InlineTriggerPrefix"
+local DEFAULT_INLINE_TRIGGER_PREFIX = ","
+
+local AUTOCORRECT_SETTING_KEY = "PrettierAI_AutoCorrectEnabled"
+
+local function getNvidiaModel(): string
+	local stored = plugin:GetSetting(NVIDIA_MODEL_SETTING)
+	if type(stored) == "string" and stored ~= "" then
+		return stored
+	end
+	return DEFAULT_NVIDIA_MODEL
+end
+
+local function isQuickTriggerEnabled(): boolean
+	local v = plugin:GetSetting(QUICK_TRIGGER_ENABLED_KEY)
+	if v == nil then return true end
+	return v == true
+end
+
+local function getQuickTriggerString(): string
+	local stored = plugin:GetSetting(QUICK_TRIGGER_STRING_KEY)
+	if type(stored) == "string" and stored ~= "" then
+		return stored
+	end
+	return DEFAULT_QUICK_TRIGGER
+end
+
+local function isInlineTriggerEnabled(): boolean
+	local v = plugin:GetSetting(INLINE_TRIGGER_ENABLED_KEY)
+	if v == nil then return true end
+	return v == true
+end
+
+local function getInlineTriggerPrefix(): string
+	local stored = plugin:GetSetting(INLINE_TRIGGER_PREFIX_KEY)
+	if type(stored) == "string" and stored ~= "" then
+		return stored
+	end
+	return DEFAULT_INLINE_TRIGGER_PREFIX
+end
+
+local autoCorrectEnabled: boolean = plugin:GetSetting(AUTOCORRECT_SETTING_KEY) == true
+local isRequestPending: boolean = false
+local isApplyingEdit: boolean = false
+
+
+local cachedQuickTriggerEnabled: boolean = isQuickTriggerEnabled()
+local cachedQuickTriggerString: string = getQuickTriggerString()
+local cachedInlineTriggerEnabled: boolean = isInlineTriggerEnabled()
+local cachedInlineTriggerPrefix: string = getInlineTriggerPrefix()
+
+
+local ECHO_WINDOW_SECONDS = 1.5
+local recentSelfEdits: { [ScriptDocument]: { [number]: { text: string, time: number } } } = {}
+
+local function recordSelfEdit(document: ScriptDocument, lineNum: number, text: string)
+	if not recentSelfEdits[document] then
+		recentSelfEdits[document] = {}
+	end
+	recentSelfEdits[document][lineNum] = { text = text, time = os.clock() }
+end
+
+local function isEchoOfSelfEdit(document: ScriptDocument, lineNum: number, currentText: string?): boolean
+	local docEdits = recentSelfEdits[document]
+	if not docEdits then return false end
+	local entry = docEdits[lineNum]
+	if not entry then return false end
+	if os.clock() - entry.time > ECHO_WINDOW_SECONDS then
+		docEdits[lineNum] = nil
+		return false
+	end
+	return (currentText :: string?) == entry.text
+end
+
+local function escapeLuaPattern(str: string): string
+	local escaped = string.gsub(str, "[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1" :: string)
+	return escaped
+end
+
+-- Plugin Toolbar UI setup
+local toolbar: PluginToolbar = plugin:CreateToolbar("PrettierAI")
+
+local togglePanelBtn: PluginToolbarButton = toolbar:CreateButton(
+	"Toggle Panel",
+	"Opens or closes the unified PrettierAI action and configuration window",
+	""
+)
+
+local toolbarAutoCorrectBtn: PluginToolbarButton = toolbar:CreateButton(
+	"Toggle Auto-Correct",
+	"Toggle Auto-Correct on Enter ON or OFF",
+	""
+)
+
+local toolbarQuickTriggerBtn: PluginToolbarButton = toolbar:CreateButton(
+	"Toggle Quick Trigger",
+	"Toggle Quick-Format Trigger (,,) ON or OFF",
+	""
+)
+
+local toolbarInlineTriggerBtn: PluginToolbarButton = toolbar:CreateButton(
+	"Toggle Inline Trigger",
+	"Toggle Inline-Generation Trigger (,) ON or OFF",
+	""
+)
+
+local formatLineAction: PluginAction = plugin:CreatePluginAction(
+	"PrettierAI_FormatLineAction",
+	"PrettierAI: Format Current Line",
+	"Adds type annotations and fixes casing/spacing on the current line",
+	"",
+	true
+)
+
+local formatScriptAction: PluginAction = plugin:CreatePluginAction(
+	"PrettierAI_FormatScriptAction",
+	"PrettierAI: Format Script",
+	"Formats the whole active script with consistent types",
+	"",
+	true
+)
+
+local widgetInfo: DockWidgetPluginGuiInfo = DockWidgetPluginGuiInfo.new(
+	Enum.InitialDockState.Float,
+	false,
+	false,
+	340,
+	520,
+	300,
+	420
+)
+toolbarAutoCorrectBtn.ClickableWhenViewportHidden = true
+toolbarQuickTriggerBtn.ClickableWhenViewportHidden = true
+toolbarInlineTriggerBtn.ClickableWhenViewportHidden = true
+togglePanelBtn.ClickableWhenViewportHidden = true
+local widget: DockWidgetPluginGui = plugin:CreateDockWidgetPluginGuiAsync("PrettierAI_Settings", widgetInfo)
+widget.Title = "PrettierAI Panel"
+
+local mainFrame: ScrollingFrame = Instance.new("ScrollingFrame")
+mainFrame.Size = UDim2.new(1, 0, 1, 0)
+mainFrame.BorderSizePixel = 0
+mainFrame.ScrollBarThickness = 6
+mainFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+mainFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+mainFrame.Parent = widget
+
+local padding: UIPadding = Instance.new("UIPadding")
+padding.PaddingTop = UDim.new(0, 12)
+padding.PaddingBottom = UDim.new(0, 12)
+padding.PaddingLeft = UDim.new(0, 12)
+padding.PaddingRight = UDim.new(0, 12)
+padding.Parent = mainFrame
+
+local layout: UIListLayout = Instance.new("UIListLayout")
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Padding = UDim.new(0, 6)
+layout.Parent = mainFrame
+
+local function makeLabel(text: string, order: number, bold: boolean?): TextLabel
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, 16)
+	label.BackgroundTransparency = 1
+	label.Font = if bold then Enum.Font.SourceSansBold else Enum.Font.SourceSansItalic
+	label.TextSize = if bold then 13 else 12
+	label.Text = text
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.LayoutOrder = order
+	label.Parent = mainFrame
+	return label
+end
+
+local function makeTextBox(placeholder: string, order: number, font: Enum.Font?): TextBox
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(1, 0, 0, 30)
+	box.BorderSizePixel = 0
+	box.BackgroundTransparency = 1
+	box.Font = font or Enum.Font.SourceSans
+	box.TextSize = 12
+	box.PlaceholderText = placeholder
+	box.ClearTextOnFocus = false
+	box.LayoutOrder = order
+	box.Parent = mainFrame
+	return box
+end
+
+local function makeToggleButton(order: number): TextButton
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 0, 28)
+	btn.BackgroundTransparency = 0
+	btn.BorderSizePixel = 1
+	btn.Font = Enum.Font.SourceSansBold
+	btn.TextSize = 12
+	btn.LayoutOrder = order
+	btn.Parent = mainFrame
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 4)
+	corner.Parent = btn
+	return btn
+end
+
+-- Section 1: Quick Actions (Relocated execution interface inside the widget)
+local actionsHeader = makeLabel("Quick Actions:", 1, true)
+
+local formatLineUIBtn = Instance.new("TextButton")
+formatLineUIBtn.Name = "FormatLineUIBtn"
+formatLineUIBtn.Size = UDim2.new(1, 0, 0, 32)
+formatLineUIBtn.Font = Enum.Font.SourceSansBold
+formatLineUIBtn.TextSize = 13
+formatLineUIBtn.Text = "Format Current Line"
+formatLineUIBtn.LayoutOrder = 2
+formatLineUIBtn.Parent = mainFrame
+local lineCorner = Instance.new("UICorner")
+lineCorner.CornerRadius = UDim.new(0, 4)
+lineCorner.Parent = formatLineUIBtn
+
+local formatScriptUIBtn = Instance.new("TextButton")
+formatScriptUIBtn.Name = "FormatScriptUIBtn"
+formatScriptUIBtn.Size = UDim2.new(1, 0, 0, 32)
+formatScriptUIBtn.Font = Enum.Font.SourceSansBold
+formatScriptUIBtn.TextSize = 13
+formatScriptUIBtn.Text = "Format Active Script"
+formatScriptUIBtn.LayoutOrder = 3
+formatScriptUIBtn.Parent = mainFrame
+local scriptCorner = Instance.new("UICorner")
+scriptCorner.CornerRadius = UDim.new(0, 4)
+scriptCorner.Parent = formatScriptUIBtn
+
+local divider = Instance.new("Frame")
+divider.Size = UDim2.new(1, 0, 0, 1)
+divider.BorderSizePixel = 0
+divider.LayoutOrder = 4
+divider.Parent = mainFrame
+
+-- Section 2: Configuration & Logs
+local titleLabel = makeLabel(NVIDIA_LABEL .. " API Key:", 5, true)
+local apiKeyInput = makeTextBox("Paste your nvapi-... key here...", 6, Enum.Font.Code)
+apiKeyInput.Text = (plugin:GetSetting(NVIDIA_API_KEY_SETTING) :: string?) or ""
+apiKeyInput.BackgroundTransparency = 0
+apiKeyInput.BorderSizePixel = 1
+local apiCorner = Instance.new("UICorner")
+apiCorner.CornerRadius = UDim.new(0, 4)
+apiCorner.Parent = apiKeyInput
+
+local modelLabel = makeLabel("Model:", 7, true)
+local modelInput = makeTextBox(DEFAULT_NVIDIA_MODEL, 8, Enum.Font.Code)
+modelInput.Text = getNvidiaModel()
+
+local autoCorrectBtn = makeToggleButton(9)
+local quickTriggerToggleBtn = makeToggleButton(10)
+local quickTriggerLabel = makeLabel("Quick-Format Trigger (type at end of line):", 11)
+local quickTriggerInput = makeTextBox(DEFAULT_QUICK_TRIGGER, 12, Enum.Font.Code)
+quickTriggerInput.Text = getQuickTriggerString()
+
+local inlineTriggerToggleBtn = makeToggleButton(13)
+local inlineTriggerLabel = makeLabel("Inline-Generation Prefix (e.g. ',' before '( prompt )'):", 14)
+local inlineTriggerInput = makeTextBox(DEFAULT_INLINE_TRIGGER_PREFIX, 15, Enum.Font.Code)
+inlineTriggerInput.Text = getInlineTriggerPrefix()
+
+local helpLabel = makeLabel("", 16)
+helpLabel.Size = UDim2.new(1, 0, 0, 70)
+helpLabel.TextWrapped = true
+helpLabel.Text = "Keyboard shortcuts for Format Line / Format Script are bound in Studio itself: "
+	.. "File -> Advanced -> Customize Shortcuts, search 'PrettierAI'. "
+	.. "Everything above is customizable right here — toggle a trigger off, or change what text activates it."
+
+local statusLabel = makeLabel("Ready", 17, true)
+statusLabel.Font = Enum.Font.SourceSansSemibold
+statusLabel.TextSize = 11
+
+local function logStatus(message: string, isError: boolean?)
+	statusLabel.Text = message
+	if isError then
+		statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+		warn("[PrettierAI]: " .. message)
+	else
+		statusLabel.TextColor3 = Color3.fromRGB(85, 170, 127)
+		print("[PrettierAI]: " .. message)
+	end
+end
+
+local function refreshToggleButtons()
+	local studioSettings = (settings() :: any).Studio
+	local theme = studioSettings.Theme
+	local function setToggleVisual(btn: TextButton, label: string, enabled: boolean)
+		btn.Text = label .. ": " .. (if enabled then "ON" else "OFF")
+		btn.TextColor3 = if enabled 
+			then Color3.fromRGB(85, 170, 127) 
+			else theme:GetColor(Enum.StudioStyleGuideColor.DimmedText)
+	end
+	setToggleVisual(autoCorrectBtn, "Auto-Correct on Enter", autoCorrectEnabled)
+	setToggleVisual(quickTriggerToggleBtn, "Quick-Format Trigger", cachedQuickTriggerEnabled)
+	setToggleVisual(inlineTriggerToggleBtn, "Inline-Generation Trigger", cachedInlineTriggerEnabled)
+end
+
+-- Keep toolbar highlights and UI buttons completely synchronized
+local function syncToggleStates()
+	if toolbarAutoCorrectBtn then toolbarAutoCorrectBtn:SetActive(autoCorrectEnabled) end
+	if toolbarQuickTriggerBtn then toolbarQuickTriggerBtn:SetActive(cachedQuickTriggerEnabled) end
+	if toolbarInlineTriggerBtn then toolbarInlineTriggerBtn:SetActive(cachedInlineTriggerEnabled) end
+	refreshToggleButtons()
+end
+
+local function toggleAutoCorrect()
+	autoCorrectEnabled = not autoCorrectEnabled
+	plugin:SetSetting(AUTOCORRECT_SETTING_KEY, autoCorrectEnabled)
+	syncToggleStates()
+	logStatus("Auto-Correct on Enter: " .. (if autoCorrectEnabled then "ON" else "OFF"))
+end
+
+local function toggleQuickTrigger()
+	local newState = not isQuickTriggerEnabled()
+	plugin:SetSetting(QUICK_TRIGGER_ENABLED_KEY, newState)
+	cachedQuickTriggerEnabled = newState
+	syncToggleStates()
+	logStatus("Quick-Format Trigger: " .. (if cachedQuickTriggerEnabled then "ON" else "OFF"))
+end
+
+local function toggleInlineTrigger()
+	local newState = not isInlineTriggerEnabled()
+	plugin:SetSetting(INLINE_TRIGGER_ENABLED_KEY, newState)
+	cachedInlineTriggerEnabled = newState
+	syncToggleStates()
+	logStatus("Inline-Generation Trigger: " .. (if cachedInlineTriggerEnabled then "ON" else "OFF"))
+end
+
+apiKeyInput.FocusLost:Connect(function()
+	plugin:SetSetting(NVIDIA_API_KEY_SETTING, apiKeyInput.Text)
+	logStatus(NVIDIA_LABEL .. " API key saved.")
+end)
+
+modelInput.FocusLost:Connect(function()
+	local trimmed = string.match(modelInput.Text, "^%s*(.-)%s*$") or ""
+	if trimmed == "" then
+		trimmed = DEFAULT_NVIDIA_MODEL
+		modelInput.Text = trimmed
+	end
+	plugin:SetSetting(NVIDIA_MODEL_SETTING, trimmed)
+	logStatus("Model set to " .. trimmed)
+end)
+
+autoCorrectBtn.MouseButton1Click:Connect(toggleAutoCorrect)
+quickTriggerToggleBtn.MouseButton1Click:Connect(toggleQuickTrigger)
+inlineTriggerToggleBtn.MouseButton1Click:Connect(toggleInlineTrigger)
+
+toolbarAutoCorrectBtn.Click:Connect(toggleAutoCorrect)
+toolbarQuickTriggerBtn.Click:Connect(toggleQuickTrigger)
+toolbarInlineTriggerBtn.Click:Connect(toggleInlineTrigger)
+
+togglePanelBtn.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+end)
+
+local function applyTheme()
+	local studioSettings = (settings() :: any).Studio
+	local theme = studioSettings.Theme
+	mainFrame.BackgroundColor3 = theme:GetColor(Enum.StudioStyleGuideColor.MainBackground)
+	divider.BackgroundColor3 = theme:GetColor(Enum.StudioStyleGuideColor.Border)
+	for _, inst in ipairs(mainFrame:GetChildren()) do
+		if inst:IsA("TextLabel") then
+			inst.TextColor3 = if inst.Font == Enum.Font.SourceSansItalic
+				then theme:GetColor(Enum.StudioStyleGuideColor.DimmedText)
+				else theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+		elseif inst:IsA("TextBox") then
+			if inst == apiKeyInput then
+				inst.BackgroundColor3 = theme:GetColor(Enum.StudioStyleGuideColor.InputFieldBackground)
+				inst.TextColor3 = theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+				inst.BorderColor3 = theme:GetColor(Enum.StudioStyleGuideColor.Border)
+			else
+				inst.BackgroundTransparency = 1
+				inst.TextColor3 = theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+			end
+		elseif inst:IsA("TextButton") then
+			if inst.Name == "FormatLineUIBtn" then
+				inst.BackgroundColor3 = theme:GetColor(Enum.StudioStyleGuideColor.MainButton)
+				inst.TextColor3 = Color3.new(1, 1, 1) -- Static white for legibility on colored button
+				inst.BorderSizePixel = 0
+			elseif inst.Name == "FormatScriptUIBtn" then
+				inst.BackgroundColor3 = theme:GetColor(Enum.StudioStyleGuideColor.Button)
+				inst.TextColor3 = theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+				inst.BorderColor3 = theme:GetColor(Enum.StudioStyleGuideColor.Border)
+				inst.BorderSizePixel = 1
+			else
+				-- Toggle buttons are structured rounded buttons
+				inst.BackgroundColor3 = theme:GetColor(Enum.StudioStyleGuideColor.Button)
+				inst.BorderColor3 = theme:GetColor(Enum.StudioStyleGuideColor.Border)
+				inst.BackgroundTransparency = 0
+				inst.BorderSizePixel = 1
+			end
+		end
+	end
+	statusLabel.TextColor3 = theme:GetColor(Enum.StudioStyleGuideColor.DimmedText)
+	syncToggleStates()
+end
+(settings() :: any).Studio.ThemeChanged:Connect(applyTheme)
+applyTheme()
+
+print("[PrettierAI v16-consistent-detection] Plugin loaded. Provider: " .. NVIDIA_LABEL .. " (" .. getNvidiaModel() .. "). Nothing runs until you press a button or hit a trigger you've enabled.")
+
+--======================================================================
+-- CORE HELPERS
+--======================================================================
+
+local function trim(str: string?): string?
+	if not str then return nil end
+	return (string.gsub(str, "^%s*(.-)%s*$", "%1"))
+end
+
+local function getLineSafe(document: ScriptDocument, lineNum: number): string?
+	local lineCount = 0
+	local successCount = pcall(function()
+		lineCount = document:GetLineCount()
+	end)
+	if not successCount or lineNum < 1 or lineNum > lineCount then
+		return nil
+	end
+	local successLine, lineText = pcall(function()
+		return document:GetLine(lineNum)
+	end)
+	return if successLine then (lineText :: string) else nil
+end
+
+local function getActiveScriptAndDocument(): (LuaSourceContainer?, ScriptDocument?)
+	local activeScript = StudioService.ActiveScript :: Script
+	if activeScript then
+		local doc = ScriptEditorService:FindScriptDocument(activeScript)
+		if doc then
+			return activeScript, doc
+		end
+	end
+	for _, item in ipairs(Selection:Get()) do
+		if item:IsA("LuaSourceContainer") then
+			local doc = ScriptEditorService:FindScriptDocument(item)
+			return item :: LuaSourceContainer, doc
+		end
+	end
+	return nil, nil
+end
+
+local function getScriptTypeContext(scriptInstance: LuaSourceContainer?): string
+	if not scriptInstance then
+		return "Unknown Environment (unassigned script)"
+	end
+	if scriptInstance:IsA("LocalScript") then
+		return "Client (LocalScript) - runs ONLY on the Client"
+	elseif scriptInstance:IsA("ModuleScript") then
+		return "Shared (ModuleScript) - can run on BOTH Client and Server. Type annotations must compile successfully in both environments."
+	elseif scriptInstance:IsA("Script") then
+		local runContext = (scriptInstance :: any).RunContext
+		if runContext == Enum.RunContext.Client then
+			return "Client (Script with Client RunContext) - runs ONLY on the Client"
+		elseif runContext == Enum.RunContext.Server then
+			return "Server (Script with Server RunContext) - runs ONLY on the Server"
+		else
+			return "Server (Legacy Script) - runs ONLY on the Server"
+		end
+	end
+	return "Unknown Environment"
+end
+
+local function getContextAbove(document: ScriptDocument, line: number): string
+	local above: { string } = {}
+	for i = math.max(1, line - 12), line - 1 do
+		local lineText = getLineSafe(document, i)
+		if lineText then
+			table.insert(above, lineText)
+		end
+	end
+	return table.concat(above, "\n")
+end
+
+-- Only used by the related-line-fix flow: value-type inference for a
+-- dictionary needs to look forward, not just back.
+local function getContextBelow(document: ScriptDocument, line: number, maxLines: number): string
+	local below: { string } = {}
+	local lineCount = document:GetLineCount()
+	for i = line + 1, math.min(lineCount, line + maxLines) do
+		local lineText = getLineSafe(document, i)
+		if lineText then
+			table.insert(below, lineText)
+		end
+	end
+	return table.concat(below, "\n")
+end
+
+local function splitLines(text: string): { string }
+	local lines: { string } = {}
+	local index = 1
+	while true do
+		local newlineAt = string.find(text, "\n", index, true)
+		if not newlineAt then
+			table.insert(lines, string.sub(text, index))
+			break
+		end
+		table.insert(lines, string.sub(text, index, newlineAt - 1))
+		index = newlineAt + 1
+	end
+	return lines
+end
+
+local function levenshteinDistance(a: string, b: string): number
+	local lenA, lenB = #a, #b
+	if lenA == 0 then return lenB end
+	if lenB == 0 then return lenA end
+	local prevRow: { number } = table.create(lenB + 1) :: any
+	local currRow: { number } = table.create(lenB + 1) :: any
+	for j = 0, lenB do
+		prevRow[j] = j
+	end
+	for i = 1, lenA do
+		currRow[0] = i
+		local charA = string.sub(a, i, i)
+		for j = 1, lenB do
+			local charB = string.sub(b, j, j)
+			local cost = if charA == charB then 0 else 1
+			currRow[j] = math.min(prevRow[j] + 1, currRow[j - 1] + 1, prevRow[j - 1] + cost)
+		end
+		prevRow, currRow = currRow, prevRow
+	end
+	return prevRow[lenB]
+end
+
+local function bracketBalance(text: string): (number, number, number)
+	local _, roundOpen = string.gsub(text, "%(", "")
+	local _, roundClose = string.gsub(text, "%)", "")
+	local _, squareOpen = string.gsub(text, "%[", "")
+	local _, squareClose = string.gsub(text, "%]", "")
+	local _, curlyOpen = string.gsub(text, "{", "")
+	local _, curlyClose = string.gsub(text, "}", "")
+	return roundOpen - roundClose, squareOpen - squareClose, curlyOpen - curlyClose
+end
+
+local function isSafeLineReplacement(original: string, candidate: string): boolean
+	if candidate == "" then return false end
+	if string.find(candidate, "\n") or string.find(candidate, "\r") then return false end
+
+	local trimmedOriginal = string.match(original, "^%s*(.-)%s*$") or ""
+	if trimmedOriginal == "" then
+		local trimmedCandidate = string.match(candidate, "^%s*(.-)%s*$") or ""
+		return trimmedCandidate == ""
+	end
+
+	local origRound, origSquare, origCurly = bracketBalance(original)
+	local candRound, candSquare, candCurly = bracketBalance(candidate)
+	if origRound ~= candRound or origSquare ~= candSquare or origCurly ~= candCurly then
+		return false
+	end
+
+	local lengthDelta = #candidate - #original
+	local maxLengthDelta = math.max(100, math.floor(#original * 1.5))
+	local minLengthDelta = -math.max(30, math.floor(#original * 0.5))
+	if lengthDelta > maxLengthDelta or lengthDelta < minLengthDelta then return false end
+
+	local distance = levenshteinDistance(original, candidate)
+	local threshold = math.max(80, math.floor(#original * 1.2))
+	if distance > threshold then return false end
+
+	return true
+end
+
+local function ensureStrictAnnotation(text: string): string
+	local trimmed = string.match(text, "^%s*(.*)$") or text
+	if not string.match(trimmed, "^%s*%-%-%!strict" :: string) and not string.match(trimmed, "^%s*%-%-%!nonstrict" :: string) then
+		return "--!strict\n" .. text
+	end
+	return text
+end
+
+--======================================================================
+-- ADDED STRICT HEURISTICS & STATE TRACKERS
+--======================================================================
+
+local documentStrictHeaderConfirmed: { [ScriptDocument]: boolean } = {}
+
+local function captureCursor(document: ScriptDocument): (boolean, number, number)
+	local success, startLine, startCol, endLine, endCol = pcall(function()
+		return document:GetSelection()
+	end)
+	if success and startLine and startCol then
+		return true, startLine, startCol
+	end
+	return false, 0, 0
+end
+
+local function restoreCursor(document: any, line: number, col: number)
+	pcall(function()
+		document:SetSelection(line , col, line, col)
+	end)
+end
+
+local function ensureStrictHeaderPresent(document: ScriptDocument)
+	if documentStrictHeaderConfirmed[document] then return end
+	local lineCount = document:GetLineCount()
+	if lineCount > 0 then
+		local firstLine = getLineSafe(document, 1)
+		if firstLine then
+			local trimmed = string.match(firstLine, "^%s*(.*)$") or firstLine
+			if not string.match(trimmed, "^%s*%-%-%!strict" :: string) and not string.match(trimmed, "^%s*%-%-%!nonstrict" :: string) then
+				isApplyingEdit = true
+				local editOk = pcall(function()
+					document:EditTextAsync("--!strict\n", 1, 1, 1, 1)
+				end)
+				isApplyingEdit = false
+				if editOk then
+					recordSelfEdit(document, 1, "--!strict\n" .. firstLine)
+				end
+			end
+		end
+	end
+	documentStrictHeaderConfirmed[document] = true
+end
+
+local function parseLineBlocks(text: string): { [number]: string }
+	local blocks: { [number]: string } = {}
+	for lineNumStr, content in string.gmatch(text, "%-%-%-LINE%s*(%d+)%-%-%-[\r\n]*(.-)[\r\n]*%-%-%-END%-%-%-") do
+		local ln = tonumber(lineNumStr)
+		if ln then
+			blocks[ln] = content
+		end
+	end
+	return blocks
+end
+
+--======================================================================
+-- NVIDIA NIM API CALL
+--======================================================================
+
+local function safeDecodeResponse(response: any): (boolean, any)
+	local decodeOk, decoded = pcall(function()
+		return HttpService:JSONDecode(response.Body)
+	end)
+	if not decodeOk or type(decoded) ~= "table" then
+		local snippet = string.sub(tostring(response.Body or ""), 1, 200)
+		if snippet == "" then snippet = "(empty response body)" end
+		return false, "HTTP " .. tostring(response.StatusCode) .. ": " .. snippet
+	end
+	return true, decoded
+end
+
+local function stripMarkdownFence(text: string): string
+	text = string.gsub(text, "^```%w*\n", "")
+	text = string.gsub(text, "\n```$", "")
+	text = string.gsub(text, "^```%w*", "")
+	text = string.gsub(text, "```$", "")
+	return text
+end
+
+local function callNvidiaAPI(systemPrompt: string, payload: string): (boolean, string)
+	local apiKey = (plugin:GetSetting(NVIDIA_API_KEY_SETTING) :: string?) or ""
+	if apiKey == "" then
+		return false, "Missing " .. NVIDIA_LABEL .. " API key. Paste it in PrettierAI Settings."
+	end
+	local model = getNvidiaModel()
+
+	local requestBody = {
+		model = model,
+		temperature = 0,
+		messages = {
+			{ role = "system", content = systemPrompt },
+			{ role = "user", content = payload },
+		},
+	}
+	local success, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = NVIDIA_BASE_URL,
+			Method = "POST",
+			Headers = {
+				["Content-Type"] = "application/json",
+				["Authorization"] = "Bearer " .. apiKey,
+			},
+			Body = HttpService:JSONEncode(requestBody),
+		})
+	end)
+	if not success then
+		return false, "HTTP Error: " .. tostring(response)
+	end
+	local decodeOk, responseData = safeDecodeResponse(response)
+	if not decodeOk then
+		return false, "[" .. NVIDIA_LABEL .. " / " .. model .. "] " .. responseData
+	end
+	if responseData.error then
+		local errMsg = responseData.error
+		if type(errMsg) == "table" then
+			errMsg = errMsg.message or HttpService:JSONEncode(errMsg)
+		end
+		return false, "[" .. NVIDIA_LABEL .. " / " .. model .. "] API Error: " .. tostring(errMsg)
+	end
+	local choices = responseData.choices
+	if choices and choices[1] and choices[1].message and choices[1].message.content then
+		return true, stripMarkdownFence(tostring(choices[1].message.content))
+	end
+	return false, "[" .. NVIDIA_LABEL .. " / " .. model .. "] Malformed response structure."
+end
+
+local function callNvidiaAPIWithRetry(systemPrompt: string, payload: string): (boolean, string)
+	local maxRetries = 3
+	local retryDelay = 2
+	local success: boolean, result: string
+
+	for attempt = 1, maxRetries + 1 do
+		success, result = callNvidiaAPI(systemPrompt, payload)
+		if success then
+			return true, result
+		end
+
+		local isTransient = string.find(result, "Timedout") :: any ~= nil
+			or string.find(result, "ResourceExhausted") :: any ~= nil
+			or string.find(result, "Too Many Requests") :: any ~= nil
+			or string.find(result, "limit reached") :: any ~= nil
+			or string.find(result, "HTTP 429") :: any ~= nil
+
+		if not isTransient or attempt > maxRetries then
+			break
+		end
+
+		logStatus("Transient error: " .. tostring(result) .. ". Retrying in " .. retryDelay .. "s (attempt " .. attempt .. ")...", true)
+		task.wait(retryDelay)
+		retryDelay *= 2
+	end
+
+	return false, result
+end
+
+--======================================================================
+-- PROMPTS
+--======================================================================
+
+local MISSION_STATEMENT = "You are the type-annotation and formatting engine inside a Roblox Studio plugin called PrettierAI. "
+	.. "Your primary objective is to convert normal, loosely typed, or untyped Luau code into clean, highly descriptive '--!strict' code. "
+	.. "You must design your types specifically so that Roblox Studio's autocomplete, hover-over tooltips, autofill, and signature hints have maximum visibility. "
+	.. "You must constantly look for places to introduce, update, and resolve types. Every variable, table, parameter, and function must have explicit, accurate types.\n\n"
+
+local COMMON_RETURN_TYPES_REFERENCE = "COMMON ROBLOX API RETURN TYPES (use these directly, don't guess):\n"
+	.. "- Players:GetPlayers() -> { Player }\n"
+	.. "- Instance:GetChildren() / :GetDescendants() -> { Instance }\n"
+	.. "- Players.LocalPlayer -> Player? (optional, only non-nil on the Client)\n"
+	.. "- Player.Character -> Model? (optional)\n"
+	.. "- Player:GetMouse() -> Mouse\n"
+	.. "- game:GetService(name) -> the specific service's own type (e.g. Players, RunService, ReplicatedStorage, Workspace, TweenService), never 'Instance'\n"
+	.. "- Instance.new(className) -> the specific class named (e.g. Instance.new(\"Part\") -> Part, Instance.new(\"Frame\") -> Frame)\n"
+	.. "- workspace:Raycast(...) -> RaycastResult?\n"
+	.. "- TweenService:Create(...) -> Tween\n"
+	.. "- CollectionService:GetTagged(tag) -> { Instance }\n"
+	.. "- table.insert / table.remove operate on array-shaped tables ({ Value }), not dictionaries\n"
+
+local LUAU_TYPING_PITFALLS_REFERENCE = "CRITICAL LUAU PITFALLS TO AVOID:\n"
+	.. "- NEVER add an explicit 'self' PARAMETER to a function defined with COLON syntax (e.g. 'function class:method(...)'). Colon syntax already implicitly provides 'self' — writing 'function class:method(self: table, x: number)' creates TWO parameters both effectively named self, which is a Luau compile error, not just a style issue. If a method needs a typed self, either (a) leave colon-syntax methods alone and don't add a self parameter, or (b) only if the function already uses DOT syntax ('function class.method(self, ...)') may you add an explicit type to the existing self parameter — never change colon syntax to dot syntax or vice versa.\n"
+	.. "- NEVER use the bare generic 'table' type as a 'fix' for an existing more specific table type. 'table' is barely more informative than 'any' and is a downgrade, not an improvement. Always keep or infer a specific shape instead: '{ [string]: any }', '{ Player }', a named exported type, etc.\n"
+	.. "- When inferring or fixing a dictionary value type '{ [K]: V }', infer V from the ACTUAL values assigned into it across the file, not a lazy default. If every assignment stores a boolean, V is boolean; if every assignment stores a string, V is string. Only use 'any' for V if the stored values are genuinely mixed or you truly cannot tell.\n"
+	.. "- NEVER work around a type problem that actually lives on a DIFFERENT line by bolting an inline type assertion ('X :: SomeType') onto the current line as a substitute fix. For example, if a table is declared '{ [Player]: any }' and this line assigns a boolean into it, the correct fix is the table's declared VALUE type becoming 'boolean' — NOT rewriting the assignment as 'Data[player] = true :: boolean'. If you can only see/edit the line with the symptom and not the line with the actual problem, leave the line unchanged rather than inventing a local workaround.\n"
+	.. "- NEVER add a type assertion cast ('X :: SomeType') onto something that is ALREADY the correct, non-optional type. game:GetService(name) already returns the exact correct, non-optional service type per the reference table above — 'local Players: Players = game:GetService(\"Players\") :: Players' is redundant noise, not a fix; the correct form is just 'local Players: Players = game:GetService(\"Players\")' with no cast at all. Casts (' :: Type') exist ONLY to narrow a genuinely OPTIONAL source (Players.LocalPlayer, Player.Character, etc.) down to a non-optional target — never add one anywhere else.\n"
+
+local DYNAMIC_TABLE_TYPING_REFERENCE = "DYNAMIC TABLE TYPE RESOLUTION:\n"
+	.. "- Constantly look at what values are written, assigned, or inserted into tables throughout the context.\n"
+	.. "- You MUST dynamically update the receiving table's declaration type to match what you put into it.\n"
+	.. "- If you put Booleans in a dictionary, key it as '{ [Player]: boolean }'. If you put Parts in an array, key it as '{ Part }'.\n"
+	.. "- Avoid fallback types like 'any' or 'table' when specific types can be inferred or constructed as a union (e.g. 'Player | string'). Leaving 'any' when assignments are present is considered incorrect.\n"
+	.. "- For structured data, complex dictionaries, or configs, create a clean custom Luau type alias at the top (e.g. 'type PlayerData = { Score: number, Active: boolean }') so Studio's autocomplete and autofill can reliably suggest fields when developers index the table.\n"
+
+local LINE_PROMPT = MISSION_STATEMENT
+	.. "SCOPE FOR THIS TASK: you're reviewing a SINGLE LINE in isolation — one line of a larger file you can't fully see. Because you can't see the rest of the file, be minimal and ultra-conservative: touch only what you're certain about. Review the provided [ACTIVE_LINE] under [ENVIRONMENT] and return a corrected version of it.\n"
+	.. COMMON_RETURN_TYPES_REFERENCE
+	.. LUAU_TYPING_PITFALLS_REFERENCE
+	.. DYNAMIC_TABLE_TYPING_REFERENCE
+	.. "RULES:\n"
+	.. "1. Do NOT rewrite logic, change structure, reorder code, or optimize anything. Keep the statement 100% structurally identical.\n"
+	.. "2. Do NOT rename or re-case ANY identifier — you can't see the rest of the file, so a rename here would break every other usage.\n"
+	.. "3. ALWAYS prioritize strict type safety. Append explicit, strict Luau type annotations (e.g. ': string', ': number', ': Player', ': Model', ': { Player }', ': { [string]: any }') where missing — including on variables assigned from a method call, using the reference table above. If the line assigns a LOCAL VARIABLE with no type annotation yet from a source that returns an optional type (like Players.LocalPlayer -> Player? or Player.Character -> Model?), add BOTH the type annotation AND the assertion cast together in the same fix — e.g. 'local Player = Players.LocalPlayer' becomes 'local Player: Player = Players.LocalPlayer :: Player', never just one half.\n"
+	.. "4. If [ENVIRONMENT] is Server, remember that client-specific fields like Players.LocalPlayer are invalid or always nil at runtime and should be treated accordingly.\n"
+	.. "5. Fix casing of built-in Roblox service/method calls only (e.g. 'getservice' -> 'GetService').\n"
+	.. "6. Fix spacing around operators (e.g. 'a=1' -> 'a = 1').\n"
+	.. "7. If the line is already correct, or you can't confidently deduce a type, return it EXACTLY as given.\n"
+	.. "8. Return ONLY the raw corrected line. Do not repeat it. No markdown fences, no commentary."
+
+local SCRIPT_PROMPT = MISSION_STATEMENT
+	.. "SCOPE FOR THIS TASK: you're given the FULL script under a specific [ENVIRONMENT] — unlike a single-line review, here you can and should look at every use of every variable across the whole file before deciding its type. Fix formatting and apply strict Luau type annotations ('--!strict') so the code compiles with ZERO static type-checking warnings — no red or orange underlines anywhere in the file.\n"
+	.. COMMON_RETURN_TYPES_REFERENCE
+	.. LUAU_TYPING_PITFALLS_REFERENCE
+	.. DYNAMIC_TABLE_TYPING_REFERENCE
+	.. "RULES:\n"
+	.. "1. Ensure '--!strict' is at the very top of the script.\n"
+	.. "2. UNTYPED VARIABLE FROM AN OPTIONAL SOURCE NEEDS BOTH THE TYPE AND THE CAST, TOGETHER, IN ONE FIX: if a local variable has NO type annotation yet and is assigned from a source that returns an optional type (e.g. Players.LocalPlayer -> Player?, Player.Character -> Model?), you must add BOTH the declared type AND the assertion cast in the same fix — never just one half. Example: 'local Player = Players.LocalPlayer' must become 'local Player: Player = Players.LocalPlayer :: Player', not just 'local Player: Player = Players.LocalPlayer' (still a type error under strict mode, since the right side is still Player?) and not left untyped either.\n"
+	.. "3. If [ENVIRONMENT] is Server, client-only fields like Players.LocalPlayer are nil at runtime. If [ENVIRONMENT] is Client, client-only types are valid but still optional. For ModuleScripts, types must be valid in both Client and Server.\n"
+	.. "4. TABLE TYPES MUST COVER EVERY USE, NOT JUST THE DECLARATION LINE: for each table variable, find EVERY place it's used anywhere in the file — table.insert, table.remove, #t, direct reads/writes like t[x], ipairs, pairs — before deciding its type.\n"
+	.. "   - You must trace how table values are written. If a table starts as 'local Data: { [Player]: any } = {}' but is assigned with 'Data[player] = true', you MUST update the declaration to 'local Data: { [Player]: boolean } = {}'. Never leave 'any' or 'table' when a concrete type (like boolean, string, or a union) can be deduced from assignments.\n"
+	.. "   - An array type like '{ Player }' ONLY supports table.insert/table.remove and numeric indices. If that same table is ALSO indexed by a non-number key anywhere (e.g. t[somePlayerInstance] = value), an array type is WRONG even if table.insert is also used on it.\n"
+	.. "   - If a table is used BOTH as an array (table.insert) AND as a dictionary keyed by something else, declare it with a union index signature covering every key type actually used, e.g. 'local t: { [number | Player]: Player | string } = {}'. Do not leave a declaration that only satisfies part of the table's real usage.\n"
+	.. "   - This applies symmetrically: a '{ [K]: V }' dictionary type must have V wide enough to cover every value ever stored in it, and K wide enough to cover every key type ever used to index it. WORKED EXAMPLE: 'local data: { [Player]: any } = {}' where the file only ever does 'data[somePlayer] = true' or 'data[somePlayer] = false' must become 'local data: { [Player]: boolean } = {}'. A value type of 'any' is a placeholder, not a finished fix, whenever the actual assignments in the file reveal something more specific — check every assignment into the table across the WHOLE file before settling on 'any'.\n"
+	.. "   - If a table represents a complex, structured object, declare a readable local 'type AliasName = { field: Type }' at the top of the file to guarantee that Studio provides clear hover hints and autofill menus.\n"
+	.. "5. Non-optional local tables and services from GetService are guaranteed truthy — remove redundant existence checks on them.\n"
+	.. "6. Add explicit, strict type annotations to local variables, function parameters, table fields, and return types where missing, deducing from usage, the reference table above, and Roblox API conventions. This includes plain method-call results (e.g. 'local x = Players:GetPlayers()' needs ': { Player }') — a missing annotation is just as much a violation as a wrong one.\n"
+	.. "7. Keep every instance of the same variable/service typed consistently the SAME way throughout the file.\n"
+	.. "8. You may fix inconsistent casing of a variable name ONLY IF you update every single occurrence of it in the file to match.\n"
+	.. "9. Fix casing of built-in Roblox service/method calls and spacing around operators.\n"
+	.. "10. Do NOT change control flow, algorithms, logic, or comments' meaning, and do not add/remove functionality. Formatting and typing only. Do NOT reorder, move, or relocate existing lines or declarations relative to each other — only insert or modify content in place, preserving the original top-to-bottom order.\n"
+	.. "11. FINAL SELF-CHECK before answering: go back through every type you just wrote or kept, and for each one, re-scan the WHOLE file for every other line touching that same identifier. If any one of those lines would still produce a strict-mode warning against the type you chose, fix the type now — do not submit a partial fix. Specifically re-verify: (a) every colon-syntax method you touched, for the self-parameter-duplication pitfall above; (b) every untyped local assigned from an optional-returning source, for the combined type+cast fix in rule 2; (c) every dictionary table's value type, for whether 'any' should actually be something more specific per rule 4.\n"
+	.. "12. Return ONLY the raw, complete corrected script. No markdown fences, no commentary."
+
+local RELATED_LINE_FIX_PROMPT = MISSION_STATEMENT
+	.. "SCOPE FOR THIS TASK: you are given a [DECLARATION_LINE] for a table, and a [USAGE_LINE] showing how that table is modified, written to, or read. "
+	.. "You also have context above and below to search for additional table updates.\n"
+	.. LUAU_TYPING_PITFALLS_REFERENCE
+	.. DYNAMIC_TABLE_TYPING_REFERENCE
+	.. "BEFORE YOU ANSWER: think it through first, briefly, under a header 'ANALYSIS:'. In 2-4 short sentences, work out: (a) what concrete key/value types are put into the table on [USAGE_LINE]-- No Luau code block provided to fix. The context contains only prompt templates, not executable Luau code. scan the surrounding context for any other assignments, (c) evaluate if the table's declaration contains 'any' (e.g. '{ [Player]: any }'), and (d) deduce the narrowest, most accurate type to replace 'any' (e.g. changing '{ [Player]: any }' to '{ [Player]: boolean }' if boolean values are assigned). Do not leave 'any' if concrete assignments exist.\n"
+	.. "RULES:\n"
+	.. "1. You may ONLY return corrected text for the two line numbers given (DECLARATION_LINE's and USAGE_LINE's) — no other line exists to you and none may be changed.\n"
+	.. "2. Update [DECLARATION_LINE] to fully specify the key and value types. If the table is used with specific types, rewrite its declaration to replace generic placeholder types like 'any' or empty brackets with those explicit types.\n"
+	.. "3. Do NOT rename or re-case any identifier on either line.\n"
+	.. "4. Do NOT change logic or structure on either line — this is a type-annotation fix only.\n"
+	.. "5. If a line is already correct, omit it entirely from your response — do not repeat unchanged lines.\n"
+	.. "6. After your ANALYSIS, give your final answer using EXACTLY this format, one block per line you are changing (zero, one, or two blocks total):\n"
+	.. "---LINE <line number>---\n<corrected content for that line>\n---END---\n"
+	.. "The ANALYSIS section may contain free-form reasoning, but everything after it must be ONLY these blocks — no markdown fences, no summary, no commentary after the last block."
+
+local INLINE_SYSTEM_PROMPT_TEMPLATE = "You are an ultra-fast, precise Luau inline code-generation assistant inside a Roblox Studio plugin called PrettierAI, whose standard is professional, strictly-typed code — code where Studio's autocomplete and IntelliSense can rely on explicit, accurate types instead of 'any'. Anything you generate must meet that same bar.\n"
+	.. COMMON_RETURN_TYPES_REFERENCE
+	.. DYNAMIC_TABLE_TYPING_REFERENCE
+	.. "Review the surrounding code context [CONTEXT_ABOVE] and the target line [ACTIVE_LINE] containing the user's request inside the trigger: %s\n"
+	.. "Your ONLY job is to return the completed, formatted, strictly-typed Luau code snippet that should replace the trigger block.\n"
+	.. "RULES:\n"
+	.. "1. Do NOT write explanations, comments about your process, or wrap the response in markdown fences.\n"
+	.. "2. Return ONLY the raw code that should directly replace the trigger block."
+
+--======================================================================
+-- RELATED LINE DETECTION HEURISTICS
+--======================================================================
+
+local SIMPLE_KEY_TYPES = { string = true, number = true }
+
+local function stripOptionalMark(typeName: string): string
+	return (string.gsub(typeName, "%?$", ""))
+end
+
+local function inferLiteralValueType(expr: string): string?
+	local trimmed = string.match(expr, "^%s*(.-)%s*$") or expr
+	trimmed = string.match(trimmed, "^(.-)%s*::%s*[%w_%?]+%s*$") or trimmed
+	trimmed = string.match(trimmed, "^%s*(.-)%s*$") or trimmed
+	if trimmed == "true" or trimmed == "false" then
+		return "boolean"
+	end
+	if string.match(trimmed, '^"[^"]*"$') or string.match(trimmed, "^'[^']*'$") then
+		return "string"
+	end
+	if string.match(trimmed, "^%-?%d+%.?%d*$") then
+		return "number"
+	end
+	return nil
+end
+
+local function findTableDeclarationInfo(document: ScriptDocument, tableName: string, beforeLine: number): (number?, string?, string?, string?)
+	local dictPattern = "local%s+" .. tableName .. "%s*:%s*{%s*%[%s*([%w_%?]+)%s*%]%s*:%s*([%w_%?]+)%s*}"
+	local arrayPattern = "local%s+" .. tableName .. "%s*:%s*{%s*([%w_%?]+)%s*}"
+	local untypedPattern = "local%s+" .. tableName .. "%s*=%s*{"
+
+	for i = beforeLine, math.max(1, beforeLine - 300), -1 do
+		local candidateLine = getLineSafe(document, i)
+		if candidateLine then
+			local keyType, valueType = string.match(candidateLine, dictPattern)
+			if keyType then
+				return i, "dict", stripOptionalMark(keyType), stripOptionalMark(valueType)
+			end
+			local elemType = string.match(candidateLine, arrayPattern)
+			if elemType then
+				return i, "array", stripOptionalMark(elemType), nil
+			end
+			if string.match(candidateLine, untypedPattern) then
+				return i, "untyped", nil, nil
+			end
+		end
+	end
+	return nil, nil, nil, nil
+end
+
+local function findVariableType(document: ScriptDocument, varName: string, beforeLine: number): string?
+	for i = beforeLine, math.max(1, beforeLine - 30), -1 do
+		local candidateLine = getLineSafe(document, i)
+		if candidateLine then
+			candidateLine = string.gsub(candidateLine, "[\r\n]+$", "")
+			local paramType = string.match(candidateLine, "[%(,]%s*" .. varName .. "%s*:%s*([%w_%?]+)")
+			if paramType then
+				return trim(stripOptionalMark(paramType))
+			end
+			local localType = string.match(candidateLine, "local%s+" .. varName .. "%s*:%s*([%w_%?]+)")
+			if localType then
+				return trim(stripOptionalMark(localType))
+			end
+			local assertionType = string.match(candidateLine, "local%s+" .. varName .. "%s*=.-::%s*([%w_%?]+)")
+			if assertionType then
+				return trim(stripOptionalMark(assertionType))
+			end
+		end
+	end
+	return nil
+end
+
+local function findNearbyLiteralAssignmentType(document: ScriptDocument, tableName: string, aroundLine: number): string?
+	local lineCount = document:GetLineCount()
+	local searchStart = math.max(1, aroundLine - 40)
+	local searchEnd = math.min(lineCount, aroundLine + 40)
+	local assignPattern = tableName .. "%s*%[%s*(.-)%s*%]%s*=%s*(.+)$"
+	for i = searchStart, searchEnd do
+		local candidateLine = getLineSafe(document, i)
+		if candidateLine then
+			local assignedExpr = string.match(candidateLine, assignPattern)
+			if assignedExpr then
+				local inferred = inferLiteralValueType(assignedExpr)
+				if inferred then
+					return inferred
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function detectRelatedLine(document: ScriptDocument, lineNum: number, lineText: string): (number?, string?, string?)
+	local relLine: number? = nil
+	local relText: string? = nil
+	local relationType: string? = nil
+
+	local okCall = pcall(function()
+		local tableName, keyVar = string.match(lineText, "([%a_][%w_]*)%s*%[%s*(.-)%s*%]")
+		if tableName and keyVar and keyVar ~= "true" and keyVar ~= "false" and keyVar ~= "nil" then
+			local declLine, kind, typeA, typeB = findTableDeclarationInfo(document, tableName, lineNum)
+			if declLine then
+				if kind == "untyped" then
+					relLine = declLine
+					relText = getLineSafe(document, declLine) or ""
+					relationType = "decl_found_above"
+					return
+				end
+
+				if kind == "dict" then
+					local keyVarType = inferLiteralValueType(keyVar)
+					if not keyVarType then
+						local trimmedKey = string.match(keyVar, "^%s*([%a_][%w_]*)%s*$")
+						if trimmedKey then
+							keyVarType = findVariableType(document, trimmedKey, lineNum)
+						end
+					end
+
+					if typeA and SIMPLE_KEY_TYPES[typeA] then
+						if keyVarType and not SIMPLE_KEY_TYPES[keyVarType] then
+							relLine = declLine
+							relText = getLineSafe(document, declLine) or ""
+							relationType = "decl_found_above"
+							return
+						end
+					else
+						if keyVarType and typeA and keyVarType ~= typeA then
+							relLine = declLine
+							relText = getLineSafe(document, declLine) or ""
+							relationType = "decl_found_above"
+							return
+						end
+					end
+
+					if typeB == "any" then
+						if findNearbyLiteralAssignmentType(document, tableName, lineNum) then
+							relLine = declLine
+							relText = getLineSafe(document, declLine) or ""
+							relationType = "decl_found_above"
+							return
+						end
+					end
+				end
+
+				if kind == "array" then
+					local keyVarType = inferLiteralValueType(keyVar)
+					if not keyVarType then
+						local trimmedKey = string.match(keyVar, "^%s*([%a_][%w_]*)%s*$")
+						if trimmedKey then
+							keyVarType = findVariableType(document, trimmedKey, lineNum)
+						end
+					end
+					if keyVarType and keyVarType ~= "number" then
+						relLine = declLine
+						relText = getLineSafe(document, declLine) or ""
+						relationType = "decl_found_above"
+						return
+					end
+				end
+			end
+		end
+
+		local insertTableName, insertedVar = string.match(lineText, "table%.insert%s*%(%s*([%a_][%w_]*)%s*,%s*([%a_][%w_]*)%s*%)")
+		if insertTableName and insertedVar then
+			local declLine, kind, typeA = findTableDeclarationInfo(document, insertTableName, lineNum)
+			if declLine then
+				if kind == "untyped" then
+					relLine = declLine
+					relText = getLineSafe(document, declLine) or ""
+					relationType = "decl_found_above"
+					return
+				end
+				if kind == "array" then
+					if typeA and typeA ~= "any" then
+						local insertedVarType = findVariableType(document, insertedVar, lineNum)
+						if insertedVarType and insertedVarType ~= typeA then
+							relLine = declLine
+							relText = getLineSafe(document, declLine) or ""
+							relationType = "decl_found_above"
+							return
+						end
+					elseif typeA == "any" then
+						local insertedVarType = findVariableType(document, insertedVar, lineNum)
+						if insertedVarType then
+							relLine = declLine
+							relText = getLineSafe(document, declLine) or ""
+							relationType = "decl_found_above"
+							return
+						end
+					end
+				end
+				if kind == "dict" and typeA and typeA ~= "number" then
+					relLine = declLine
+					relText = getLineSafe(document, declLine) or ""
+					relationType = "decl_found_above"
+					return
+				end
+			end
+		end
+	end)
+
+	if okCall and relLine and relText then 
+		return relLine, relText, relationType
+	end
+
+	local relUsageLine: number? = nil
+	local relUsageText: string? = nil
+
+	local okDeclCall = pcall(function()
+		local tableName = string.match(lineText, "local%s+([%a_][%w_]*)%s*:%s*{.-}%s*=%s*{%s*}")
+			or string.match(lineText, "local%s+([%a_][%w_]*)%s*=%s*{%s*}")
+
+		if tableName then
+			local lineCount = document:GetLineCount()
+			for i = lineNum + 1, math.min(lineCount, lineNum + 100) do
+				local candidateLine = getLineSafe(document, i)
+				if candidateLine then
+					local hasAssign = string.match(candidateLine, tableName .. "%s*%[%s*.-%s*%]%s*=%s*(..+)")
+					local hasInsert = string.match(candidateLine, "table%.insert%s*%(%s*" .. tableName .. "%s*,")
+
+					if hasAssign or hasInsert then
+						relUsageLine = i
+						relUsageText = candidateLine
+						relationType = "usage_found_below"
+						return
+					end
+				end
+			end
+		end
+	end)
+
+	if okDeclCall and relUsageLine and relUsageText then
+		return relUsageLine, relUsageText, relationType
+	end
+
+	return nil, nil, nil
+end
+
+
+
+local function resolveExpressionType(document: ScriptDocument, expr: string, lineNum: number, tables: { [string]: TableInfo }): string?
+	local trimmed = trim(expr) :: any
+	local literalType = inferLiteralValueType(trimmed)
+	if literalType then
+		return literalType
+	end
+
+	local tblName, indexExpr = string.match(trimmed, "^([%a_][%w_]*)%s*%[%s*(.-)%s*%]%s*$")
+	if tblName and tables[tblName] then
+		local info = tables[tblName]
+		if info.kind == "dict" then
+			return trim(info.valueType or "any")
+		elseif info.kind == "array" then
+			return trim(info.elemType or "any")
+		end
+	end
+
+	local varName = string.match(trimmed, "^([%a_][%w_]*)$")
+	if varName then
+		local found = findVariableType(document, varName, lineNum)
+		return found and trim(found)
+	end
+
+	return nil
+end
+
+
+
+local function buildUnionType(typesMap: { [string]: boolean }): string
+	local typesList = {}
+	for t in pairs(typesMap) do
+		local trimmedT = trim(t) :: any
+		if trimmedT ~= "any" and trimmedT ~= "" then
+			table.insert(typesList, trimmedT)
+		end
+	end
+	if #typesList == 0 then
+		return "any"
+	elseif #typesList == 1 then
+		return typesList[1]
+	else
+		table.sort(typesList)
+		return table.concat(typesList, " | ")
+	end
+end
+
+local function syncTableTypesLocally(document: ScriptDocument)
+	local lineCount = document:GetLineCount()
+	local tables: { [string]: TableInfo } = {}
+
+	for i = 1, lineCount do
+		local lineText = getLineSafe(document, i)
+		if lineText then
+			lineText = string.gsub(lineText, "[\r\n]+$", "")
+			local tableName, keyType, valueType = string.match(lineText, "^%s*local%s+([%a_][%w_]*)%s*:%s*{%s*%[%s*([%w_%?|%s]+)%s*%]%s*:%s*([%w_%?|%s]+)%s*}%s*=%s*{%s*}")
+			if tableName then
+				local name: string = tableName :: string
+				tables[name] = {
+					lineNum = i,
+					kind = "dict",
+					keyType = trim(keyType),
+					valueType = trim(valueType),
+					elemType = nil,
+					rawLine = lineText
+				}
+			else
+				local tableName, elemType = string.match(lineText, "^%s*local%s+([%a_][%w_]*)%s*:%s*{%s*([%w_%?|%s]+)%s*}%s*=%s*{%s*}")
+				if tableName and elemType ~= "any" and not string.find(elemType :: any, ":") then
+					local name: string = tableName :: string
+					tables[name] = {
+						lineNum = i,
+						kind = "array",
+						keyType = nil,
+						valueType = nil,
+						elemType = trim(elemType),
+						rawLine = lineText
+					}
+				else
+					local tableName = string.match(lineText, "^%s*local%s+([%a_][%w_]*)%s*=%s*{%s*}")
+					if tableName then
+						local name: string = tableName :: string
+						tables[name] = {
+							lineNum = i,
+							kind = "untyped",
+							keyType = nil,
+							valueType = nil,
+							elemType = nil,
+							rawLine = lineText
+						}
+					end
+				end
+			end
+		end
+	end
+
+	local tableUsages: { [string]: TableUsage } = {}
+	for tableName in pairs(tables) do
+		tableUsages[tableName] = { keys = {}, values = {}, elements = {}, hasArrayInsert = false, hasDictAssign = false }
+	end
+
+	for i = 1, lineCount do
+		local lineText = getLineSafe(document, i)
+		if lineText then
+			lineText = string.gsub(lineText, "[\r\n]+$", "")
+			for tableName, usages in pairs(tableUsages) do
+				local info = tables[tableName]
+				if i == info.lineNum then continue end
+
+				local keyVar, valExpr = string.match(lineText, "^%s*" .. escapeLuaPattern(tableName) .. "%s*%[%s*(.-)%s*%]%s*=%s*(.+)$")
+				if keyVar and valExpr then
+					valExpr = string.gsub(valExpr, "%s*%-%-.*$", "")
+					usages.hasDictAssign = true
+
+					local resolvedKeyType = resolveExpressionType(document, keyVar, i, tables) or "any"
+					usages.keys[resolvedKeyType] = true
+
+					local resolvedValueType = resolveExpressionType(document, valExpr, i, tables) or "any"
+					usages.values[resolvedValueType] = true
+				end
+
+				local insertedVar = string.match(lineText, "table%.insert%s*%(%s*%%f[%%w_]" .. escapeLuaPattern(tableName) .. "%%f[^%%w_]%s*,%s*([%a_][%w_]*)%s*%)")
+				if insertedVar then
+					local varName: string = insertedVar :: string
+					usages.hasArrayInsert = true
+					local resolvedElemType = findVariableType(document, varName, i) or "any"
+					usages.elements[resolvedElemType] = true
+				end
+			end
+		end
+	end
+
+	for tableName, info in pairs(tables) do
+		local usages = tableUsages[tableName]
+		local finalKeyType = buildUnionType(usages.keys)
+		finalKeyType = string.gsub(finalKeyType, "%s*|%s*nil", "")
+		local finalValueType = buildUnionType(usages.values)
+		local finalElemType = buildUnionType(usages.elements)
+		local updatedLine: string? = nil
+
+		if usages.hasDictAssign and not usages.hasArrayInsert then
+			if finalKeyType ~= "any" and finalValueType ~= "any" then
+				local expectedLine = string.format("local %s: { [%s]: %s } = {}", tableName, finalKeyType, finalValueType)
+				local indent: string = (string.match(info.rawLine, "^(%s*)") or "") :: string
+				expectedLine = indent .. expectedLine
+				if info.rawLine ~= expectedLine then
+					updatedLine = expectedLine
+				end
+			end
+		elseif usages.hasArrayInsert and not usages.hasDictAssign then
+			if finalElemType ~= "any" then
+				local expectedLine = string.format("local %s: { %s } = {}", tableName, finalElemType)
+				local indent: string = (string.match(info.rawLine, "^(%s*)") or "") :: string
+				expectedLine = indent .. expectedLine
+				if info.rawLine ~= expectedLine then
+					updatedLine = expectedLine
+				end
+			end
+		elseif usages.hasDictAssign and usages.hasArrayInsert then
+			if finalKeyType ~= "any" and finalValueType ~= "any" then
+				local keyUnion = "number | " .. finalKeyType
+				local valueUnion = finalValueType
+				if finalElemType ~= "any" and finalElemType ~= finalValueType then
+					valueUnion = valueUnion .. " | " .. finalElemType
+				end
+				local expectedLine = string.format("local %s: { [%s]: %s } = {}", tableName, keyUnion, valueUnion)
+				local indent: string = (string.match(info.rawLine, "^(%s*)") or "") :: string
+				expectedLine = indent .. expectedLine
+				if info.rawLine ~= expectedLine then
+					updatedLine = expectedLine
+				end
+			end
+		end
+
+		if updatedLine then
+			isApplyingEdit = true
+			local syncOk = pcall(function()
+				document:EditTextAsync(updatedLine :: string, info.lineNum, 1, info.lineNum, #info.rawLine + 1)
+			end)
+			isApplyingEdit = false
+			if syncOk then
+				recordSelfEdit(document, info.lineNum, updatedLine :: string)
+				logStatus("[PrettierAI Offline-Sync] Instantly upgraded table '" .. tableName .. "' types from edits.")
+			end
+		end
+	end
+end
+
+--======================================================================
+-- UNIFIED DISPATCHER (with built-in cooldowns)
+--======================================================================
+
+local function dispatchLineCorrection(
+	document: ScriptDocument,
+	lineNum: number,
+	aiInputText: string,
+	writeRangeSnapshot: string,
+	scriptTypeContext: string,
+	successMessage: string
+)
+	isRequestPending = true
+	task.spawn(function()
+		local ok, err = pcall(function()
+			local relatedLine, relatedLineSnapshot, relationType = detectRelatedLine(document, lineNum, aiInputText)
+			local contextAbove = getContextAbove(document, lineNum)
+
+			if not relatedLine or not relatedLineSnapshot then
+				local payload = string.format("[ENVIRONMENT] %s\n[CONTEXT_ABOVE]\n%s\n\n[ACTIVE_LINE]\n%s", scriptTypeContext, contextAbove, aiInputText)
+				local success, result = callNvidiaAPIWithRetry(LINE_PROMPT, payload)
+				if not success or result == "" then
+					if result ~= "" then
+						warn("[PrettierAI]: " .. tostring(result))
+					end
+					return
+				end
+				result = string.match(result, "^%s*(.-)%s*$") or ""
+
+				local currentLineText = getLineSafe(document, lineNum)
+				if currentLineText ~= writeRangeSnapshot then
+					logStatus("Line " .. lineNum .. " changed before the fix arrived — try again.", true)
+					return
+				end
+				if result == currentLineText then return end
+				if not isSafeLineReplacement(aiInputText, result) then
+					logStatus("AI suggestion rejected for safety.", true)
+					return
+				end
+
+				local cursorOk, cursorLine, cursorCol = captureCursor(document)
+
+				isApplyingEdit = true
+				local writeOk = pcall(function()
+					document:EditTextAsync(result, lineNum, 1, lineNum, #(currentLineText :: string) + 1)
+				end)
+				isApplyingEdit = false
+				if writeOk then
+					recordSelfEdit(document, lineNum, result)
+					ensureStrictHeaderPresent(document)
+					if cursorOk then
+						restoreCursor(document, cursorLine, cursorCol)
+					end
+					logStatus(successMessage)
+				end
+				return
+			end
+
+			logStatus("Fixing line " .. lineNum .. " and its related line (line " .. relatedLine .. ")...")
+			local contextBelow = getContextBelow(document, lineNum, 8)
+
+			local declLineNum, declLineText
+			local usageLineNum, usageLineText
+
+			if relationType == "decl_found_above" then
+				declLineNum, declLineText = relatedLine, relatedLineSnapshot
+				usageLineNum, usageLineText = lineNum, aiInputText
+			else
+				declLineNum, declLineText = lineNum, aiInputText
+				usageLineNum, usageLineText = relatedLine, relatedLineSnapshot
+			end
+
+			local payload = string.format(
+				"[ENVIRONMENT] %s\n[CONTEXT_ABOVE]\n%s\n\n[DECLARATION_LINE %d]\n%s\n\n[USAGE_LINE %d]\n%s\n\n[CONTEXT_BELOW]\n%s",
+				scriptTypeContext, contextAbove, declLineNum, declLineText, usageLineNum, usageLineText, contextBelow
+			)
+			local success, result = callNvidiaAPIWithRetry(RELATED_LINE_FIX_PROMPT, payload)
+			if not success or result == "" then
+				if result ~= "" then
+					warn("[PrettierAI]: " .. tostring(result))
+				end
+				return
+			end
+
+			local blocks = parseLineBlocks(result)
+			local relLineId = relatedLine :: number
+			local relSnapshot = relatedLineSnapshot :: string
+
+			local allowedSnapshots: { [number]: string } = {
+				[lineNum] = writeRangeSnapshot,
+				[relLineId] = relSnapshot,
+			}
+
+			local toApply: { { line: number, text: string } } = {}
+			for ln, correctedText in pairs(blocks) do
+				local snapshot = allowedSnapshots[ln]
+				if snapshot then
+					correctedText = string.match(correctedText, "^%s*(.-)%s*$") or ""
+					local currentText = getLineSafe(document, ln)
+					local referenceForSafety = if ln == lineNum then aiInputText else snapshot
+					if currentText == snapshot and correctedText ~= "" and correctedText ~= currentText
+						and isSafeLineReplacement(referenceForSafety, correctedText) then
+						table.insert(toApply, { line = ln, text = correctedText })
+					end
+				end
+			end
+
+			if #toApply == 0 then
+				logStatus("No safe changes to apply.")
+				return
+			end
+
+			local cursorOk, cursorLine, cursorCol = captureCursor(document)
+
+			isApplyingEdit = true
+			local writeOk = pcall(function()
+				ChangeHistoryService:SetWaypoint("PrettierAI_RelatedLineFix")
+				for _, entry in ipairs(toApply) do
+					local origLen = #(allowedSnapshots[entry.line] :: string)
+					document:EditTextAsync(entry.text, entry.line, 1, entry.line, origLen + 1)
+				end
+				ChangeHistoryService:SetWaypoint("AfterPrettierAI_RelatedLineFix")
+			end)
+			isApplyingEdit = false
+
+			if writeOk then
+				for _, entry in ipairs(toApply) do
+					recordSelfEdit(document, entry.line, entry.text)
+				end
+				ensureStrictHeaderPresent(document)
+				if cursorOk then
+					restoreCursor(document, cursorLine, cursorCol)
+				end
+				logStatus("Fixed " .. #toApply .. " line(s), including the related declaration.")
+			else
+				logStatus("Failed to apply the fix.", true)
+			end
+		end)
+
+		task.wait(1.0)
+		isRequestPending = false
+		if not ok then
+			warn("[PrettierAI Line Correction Error]: " .. tostring(err))
+		end
+	end)
+end
+
+--======================================================================
+-- ACTION: FORMAT LINE
+--======================================================================
+
+local function formatLine()
+	if isRequestPending then
+		logStatus("An API request is already running. Please wait.", true)
+		return
+	end
+	if ((plugin:GetSetting(NVIDIA_API_KEY_SETTING) :: string?) or "") == "" then
+		widget.Enabled = true
+		logStatus("Missing " .. NVIDIA_LABEL .. " API key! Paste it in settings.", true)
+		return
+	end
+
+	local activeScript, activeDoc = getActiveScriptAndDocument()
+	if not activeDoc then
+		logStatus("Ensure a script is active in your editor.", true)
+		return
+	end
+
+	local cursorLine: number? = nil
+	local selectionSuccess = pcall(function()
+		local startLine, _, endLine, _ = activeDoc:GetSelection()
+		cursorLine = endLine or startLine
+	end)
+
+	if not selectionSuccess or not cursorLine then
+		logStatus("Couldn't read cursor position.", true)
+		return
+	end
+
+	local lineVal = cursorLine :: number
+	local lineText = getLineSafe(activeDoc, lineVal)
+	if not lineText or lineText == "" then
+		logStatus("Current line is empty — nothing to format.")
+		return
+	end
+
+	local strippedLineText = string.gsub(lineText, "%s*$", "")
+	logStatus("Formatting line " .. tostring(lineVal) .. " with " .. NVIDIA_LABEL .. "...")
+
+	local scriptTypeContext = getScriptTypeContext(activeScript)
+	dispatchLineCorrection(
+		activeDoc,
+		lineVal,
+		strippedLineText,
+		strippedLineText,
+		scriptTypeContext,
+		"Line " .. tostring(lineVal) .. " formatted."
+	)
+end
+
+--======================================================================
+-- ACTION: FORMAT SCRIPT
+--======================================================================
+
+local function formatScript()
+	if isRequestPending then
+		logStatus("An API request is already running. Please wait.", true)
+		return
+	end
+	if ((plugin:GetSetting(NVIDIA_API_KEY_SETTING) :: string?) or "") == "" then
+		widget.Enabled = true
+		logStatus("Missing " .. NVIDIA_LABEL .. " API key! Paste it in settings.", true)
+		return
+	end
+
+	local activeScript, activeDoc = getActiveScriptAndDocument()
+	if not activeDoc or not activeScript then
+		logStatus("No active script open or selected.", true)
+		return
+	end
+
+	local originalLineCount = activeDoc:GetLineCount()
+	local originalLines: { string } = {}
+	for i = 1, originalLineCount do
+		originalLines[i] = getLineSafe(activeDoc, i) or ""
+	end
+	local sourceSnapshot = table.concat(originalLines, "\n")
+
+	if sourceSnapshot == "" then
+		logStatus("The script is empty.", true)
+		return
+	end
+
+	logStatus("Formatting '" .. activeScript.Name .. "' with " .. NVIDIA_LABEL .. "...")
+	isRequestPending = true
+
+	local scriptTypeContext = getScriptTypeContext(activeScript)
+	local payload = string.format("[ENVIRONMENT] %s\n[SCRIPT_SOURCE]\n%s", scriptTypeContext, sourceSnapshot)
+
+	task.spawn(function()
+		local ok, err = pcall(function()
+			local success, result = callNvidiaAPIWithRetry(SCRIPT_PROMPT, payload)
+			if not success then
+				logStatus("Format failed: " .. tostring(result), true)
+				return
+			end
+
+			local currentLineCount = activeDoc:GetLineCount()
+			if currentLineCount ~= originalLineCount then
+				logStatus("Script changed while formatting — try again to avoid losing edits.", true)
+				return
+			end
+			for i = 1, originalLineCount do
+				if getLineSafe(activeDoc, i) ~= originalLines[i] then
+					logStatus("Script changed while formatting — try again to avoid losing edits.", true)
+					return
+				end
+			end
+
+			result = string.match(result, "^(.-)\n*$") or result
+			result = ensureStrictAnnotation(result)
+			local resultLines = splitLines(result)
+
+			if #resultLines == 0 or (#resultLines == 1 and resultLines[1] == "") then
+				logStatus("AI returned an empty script — rejected for safety, nothing was applied.", true)
+				return
+			end
+
+			local lineDelta = #resultLines - originalLineCount
+			if lineDelta > math.max(20, originalLineCount) or lineDelta < -math.max(10, math.floor(originalLineCount * 0.5)) then
+				logStatus("AI response had a very different line count — rejected for safety.", true)
+				return
+			end
+
+			local finalText = table.concat(resultLines, "\n")
+
+			local origRound, origSquare, origCurly = bracketBalance(sourceSnapshot)
+			local finalRound, finalSquare, finalCurly = bracketBalance(finalText)
+			if origRound ~= finalRound or origSquare ~= finalSquare or origCurly ~= finalCurly then
+				logStatus("AI response had unbalanced brackets compared to the original — rejected for safety.", true)
+				return
+			end
+
+			local lastLineText = originalLines[originalLineCount] or ""
+
+			isApplyingEdit = true
+			local writeOk = pcall(function()
+				ChangeHistoryService:SetWaypoint("PrettierAI_FormatScript")
+				activeDoc:EditTextAsync(finalText, 1, 1, originalLineCount, #lastLineText + 1)
+				ChangeHistoryService:SetWaypoint("AfterPrettierAI_FormatScript")
+			end)
+			isApplyingEdit = false
+
+			if writeOk then
+				documentStrictHeaderConfirmed[activeDoc] = true
+				logStatus("'" .. activeScript.Name .. "' formatted with " .. NVIDIA_LABEL .. ".")
+			else
+				logStatus("Failed to apply the formatted script.", true)
+			end
+		end)
+
+		task.wait(1.0)
+		isRequestPending = false
+		if not ok then
+			logStatus("Format Script thread error: " .. tostring(err), true)
+		end
+	end)
+end
+
+--======================================================================
+-- TEXT TRIGGERS (configurable — see settings panel)
+--======================================================================
+
+local syncDebounceThreads: { [ScriptDocument]: thread } = {}
+local enterAutoCorrectDebounceThreads: { [ScriptDocument]: thread } = {}
+
+local function debounceSyncTableTypes(document: ScriptDocument)
+	if syncDebounceThreads[document] then
+		pcall(task.cancel, syncDebounceThreads[document])
+	end
+
+	syncDebounceThreads[document] = task.spawn(function()
+		task.wait(0.8)
+		syncTableTypesLocally(document)
+		syncDebounceThreads[document] = nil
+	end)
+end
+
+ScriptEditorService.TextDocumentDidChange:Connect(function(document: ScriptDocument, changes: { DocumentChange })
+	if isApplyingEdit then return end
+
+	debounceSyncTableTypes(document)
+
+	if isRequestPending then return end
+
+	local linesToCheck: { [number]: boolean } = {}
+	for _, change in ipairs(changes) do
+		local startLine = change.range.start.line
+		local endLine = change.range["end"].line
+		for line = startLine, endLine do
+			linesToCheck[line] = true
+		end
+	end
+
+	for lineNum in pairs(linesToCheck) do
+		local lineText = getLineSafe(document, lineNum)
+		if isEchoOfSelfEdit(document, lineNum, lineText) then
+			linesToCheck[lineNum] = nil
+		end
+	end
+
+	for lineNum in pairs(linesToCheck) do
+		local lineText = getLineSafe(document, lineNum)
+		if not lineText then continue end
+
+		local scriptInstance = document:GetScript()
+		local scriptTypeContext = getScriptTypeContext(scriptInstance)
+
+		if cachedQuickTriggerEnabled then
+			local trigger = cachedQuickTriggerString
+			local pattern = escapeLuaPattern(trigger) .. "%s*$"
+			if string.find(lineText, pattern) then
+				local strippedLine = string.gsub(lineText, "%s*" .. escapeLuaPattern(trigger) .. "%s*$", "")
+
+				if string.match(strippedLine, "^%s*$") then
+					isApplyingEdit = true
+					local editOk = pcall(function()
+						document:EditTextAsync(strippedLine, lineNum, 1, lineNum, #lineText + 1)
+					end)
+					isApplyingEdit = false
+					if editOk then
+						recordSelfEdit(document, lineNum, strippedLine)
+					end
+					return
+				end
+
+				local originalFullLine = lineText
+				logStatus("Improving line " .. tostring(lineNum) .. " via quick trigger...")
+
+				dispatchLineCorrection(
+					document,
+					lineNum,
+					strippedLine,
+					originalFullLine,
+					scriptTypeContext,
+					"Line improved."
+				)
+				return
+			end
+		end
+
+		if cachedInlineTriggerEnabled then
+			local prefix = cachedInlineTriggerPrefix
+			local pattern = escapeLuaPattern(prefix) .. "%s*%b()"
+			local startPos, endPos = string.find(lineText, pattern)
+			if startPos and endPos then
+				local matchedStr = string.sub(lineText, startPos, endPos)
+				local firstParen = string.find(matchedStr, "%(")
+				local innerContent = string.sub(matchedStr, (firstParen :: number) + 1, #matchedStr - 1)
+
+				task.spawn(function()
+					isRequestPending = true
+					local ok, err = pcall(function()
+						logStatus("Processing inline prompt...")
+
+						local inlinePrompt = string.format(INLINE_SYSTEM_PROMPT_TEMPLATE, innerContent)
+						local contextAbove = getContextAbove(document, lineNum)
+						local payload = string.format("[ENVIRONMENT] %s\n[CONTEXT_ABOVE]\n%s\n\n[ACTIVE_LINE]\n%s", scriptTypeContext, contextAbove, lineText)
+
+						local success, result = callNvidiaAPIWithRetry(inlinePrompt, payload)
+						if not success or result == "" then
+							if result ~= "" then
+								warn("[PrettierAI Inline Warning]: " .. tostring(result))
+							end
+							return
+						end
+
+						result = string.match(result, "^%s*(.-)%s*$") or ""
+
+						local currentLineText = getLineSafe(document, lineNum)
+						if not currentLineText then return end
+						local curStart, curEnd = string.find(currentLineText, pattern)
+						if not curStart or not curEnd then return end
+						if string.sub(currentLineText, curStart, curEnd) ~= matchedStr then return end
+
+						local newLineText = string.sub(currentLineText, 1, curStart - 1) .. result .. string.sub(currentLineText, curEnd + 1)
+
+						isApplyingEdit = true
+						local editOk = pcall(function()
+							document:EditTextAsync(result, lineNum, curStart, lineNum, curEnd + 1)
+						end)
+						isApplyingEdit = false
+						if editOk then
+							recordSelfEdit(document, lineNum, newLineText)
+							logStatus("Inline trigger replaced.")
+						end
+					end)
+
+					task.wait(1.0)
+					isRequestPending = false
+					if not ok then
+						warn("[PrettierAI Inline Trigger Error]: " .. tostring(err))
+					end
+				end)
+				return
+			end
+		end
+	end
+
+	if autoCorrectEnabled then
+		local lastLineCompleted: number? = nil
+		for _, change in ipairs(changes) do
+			if string.find(change.text, "\n") or string.find(change.text, "\r") then
+				lastLineCompleted = change.range.start.line
+				break
+			end
+		end
+
+		if lastLineCompleted then
+			local lineText = getLineSafe(document, lastLineCompleted :: number)
+			if lineText and not string.match(lineText, "^%s*$") then
+				local strippedLineText = string.gsub(lineText, "%s*$", "")
+				local scriptInstance = document:GetScript()
+				local scriptTypeContext = getScriptTypeContext(scriptInstance)
+
+				if enterAutoCorrectDebounceThreads[document] then
+					pcall(task.cancel, enterAutoCorrectDebounceThreads[document])
+				end
+
+				enterAutoCorrectDebounceThreads[document] = task.spawn(function()
+					task.wait(0.5)
+					dispatchLineCorrection(
+						document,
+						lastLineCompleted :: number,
+						strippedLineText,
+						strippedLineText,
+						scriptTypeContext,
+						"Auto-corrected line " .. tostring(lastLineCompleted) .. "."
+					)
+					enterAutoCorrectDebounceThreads[document] = nil
+				end)
+			end
+		end
+	end
+end)
+
+
+
+formatLineUIBtn.MouseButton1Click:Connect(formatLine)
+formatLineAction.Triggered:Connect(formatLine)
+
+formatScriptUIBtn.MouseButton1Click:Connect(formatScript)
+formatScriptAction.Triggered:Connect(formatScript)
+
