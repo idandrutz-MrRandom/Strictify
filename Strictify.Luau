@@ -144,14 +144,12 @@ local autoCorrectEnabled: boolean = plugin:GetSetting(AUTOCORRECT_SETTING_KEY) =
 local isRequestPending: boolean = false
 local isApplyingEdit: boolean = false
 
-
 local cachedQuickTriggerEnabled: boolean = isQuickTriggerEnabled()
 local cachedQuickTriggerString: string = getQuickTriggerString()
 local cachedInlineTriggerEnabled: boolean = isInlineTriggerEnabled()
 local cachedInlineTriggerPrefix: string = getInlineTriggerPrefix()
 
-
-local ECHO_WINDOW_SECONDS = 1.5
+local ECHO_WINDOW_SECONDS = 1
 local recentSelfEdits: { [ScriptDocument]: { [number]: { text: string, time: number } } } = {}
 
 local function recordSelfEdit(document: ScriptDocument, lineNum: number, text: string)
@@ -666,6 +664,41 @@ local function ensureStrictAnnotation(text: string): string
 	return text
 end
 
+-- Safely restores original leading indentation to lines formatted by AI,
+-- mitigating random LLM spacing shifts.
+local function preserveIndentation(originalLines: { string }, resultLines: { string }): { string }
+	local origCount = #originalLines
+	local resCount = #resultLines
+
+	local offset = 0
+	if resCount == origCount + 1 and string.match(resultLines[1], "^%s*%-%-%!strict" :: string) then
+		offset = 1
+	elseif resCount == origCount then
+		offset = 0
+	else
+		return resultLines
+	end
+
+	for i = 1, origCount do
+		local originalLine = originalLines[i]
+		local resIndex = i + offset
+		local resultLine = resultLines[resIndex]
+		if not resultLine then continue end
+
+		local originalIndent = string.match(originalLine, "^(%s*)") or ""
+		local resultIndent = string.match(resultLine, "^(%s*)") or ""
+
+		if originalIndent ~= resultIndent then
+			local trimmedResult = string.match(resultLine, "^%s*(.-)%s*$") or ""
+			if trimmedResult ~= "" then
+				resultLines[resIndex] = originalIndent .. trimmedResult
+			end
+		end
+	end
+
+	return resultLines
+end
+
 --======================================================================
 -- ADDED STRICT HEURISTICS & STATE TRACKERS
 --======================================================================
@@ -901,7 +934,7 @@ local RELATED_LINE_FIX_PROMPT = MISSION_STATEMENT
 	.. "You also have context above and below to search for additional table updates.\n"
 	.. LUAU_TYPING_PITFALLS_REFERENCE
 	.. DYNAMIC_TABLE_TYPING_REFERENCE
-	.. "BEFORE YOU ANSWER: think it through first, briefly, under a header 'ANALYSIS:'. In 2-4 short sentences, work out: (a) what concrete key/value types are put into the table on [USAGE_LINE]-- No Luau code block provided to fix. The context contains only prompt templates, not executable Luau code. scan the surrounding context for any other assignments, (c) evaluate if the table's declaration contains 'any' (e.g. '{ [Player]: any }'), and (d) deduce the narrowest, most accurate type to replace 'any' (e.g. changing '{ [Player]: any }' to '{ [Player]: boolean }' if boolean values are assigned). Do not leave 'any' if concrete assignments exist.\n"
+	.. "BEFORE YOU ANSWER: think it through first, briefly, under a header 'ANALYSIS:'. In 2-4 short sentences, work out: (a) what concrete key/value types are put into the table on [USAGE_LINE]-- No table declaration and usage lines provided in context to analyze and fix. scan the surrounding context for any other assignments, (c) evaluate if the table's declaration contains 'any' (e.g. '{ [Player]: any }'), and (d) deduce the narrowest, most accurate type to replace 'any' (e.g. changing '{ [Player]: any }' to '{ [Player]: boolean }' if boolean values are assigned). Do not leave 'any' if concrete assignments exist.\n"
 	.. "RULES:\n"
 	.. "1. You may ONLY return corrected text for the two line numbers given (DECLARATION_LINE's and USAGE_LINE's) — no other line exists to you and none may be changed.\n"
 	.. "2. Update [DECLARATION_LINE] to fully specify the key and value types. If the table is used with specific types, rewrite its declaration to replace generic placeholder types like 'any' or empty brackets with those explicit types.\n"
@@ -1159,7 +1192,9 @@ local function detectRelatedLine(document: ScriptDocument, lineNum: number, line
 	return nil, nil, nil
 end
 
-
+--======================================================================
+-- ADDED EXPRESSION TYPE RESOLVER (HELPER FOR TABLE SYNCRONIZATION)
+--======================================================================
 
 local function resolveExpressionType(document: ScriptDocument, expr: string, lineNum: number, tables: { [string]: TableInfo }): string?
 	local trimmed = trim(expr) :: any
@@ -1187,7 +1222,9 @@ local function resolveExpressionType(document: ScriptDocument, expr: string, lin
 	return nil
 end
 
-
+--======================================================================
+-- OFFLINE DYNAMIC TYPE SYNC (Zero-latency runtime editing engine)
+--======================================================================
 
 local function buildUnionType(typesMap: { [string]: boolean }): string
 	local typesList = {}
@@ -1343,6 +1380,84 @@ local function syncTableTypesLocally(document: ScriptDocument)
 			if syncOk then
 				recordSelfEdit(document, info.lineNum, updatedLine :: string)
 				logStatus("[PrettierAI Offline-Sync] Instantly upgraded table '" .. tableName .. "' types from edits.")
+			end
+		end
+	end
+
+	-- Gather function definitions accepting a single structured table parameter
+	local functions: { [string]: {
+		lineNum: number,
+		funcName: string,
+		paramName: string,
+		rawParamType: string,
+		fields: { [string]: { [string]: boolean } },
+		rawLine: string,
+	} } = {}
+
+	for i = 1, lineCount do
+		local lineText = getLineSafe(document, i)
+		if lineText then
+			lineText = string.gsub(lineText, "[\r\n]+$", "")
+			local funcName, paramName, rawParamType = string.match(lineText, "^%s*local%s+function%s+([%a_][%w_]*)%s*%(%s*([%a_][%w_]*)%s*:%s*({.-})%s*%)")
+			if funcName and paramName and rawParamType then
+				functions[funcName] = {
+					lineNum = i,
+					funcName = funcName,
+					paramName = paramName,
+					rawParamType = trim(rawParamType) :: string,
+					fields = {},
+					rawLine = lineText,
+				}
+			end
+		end
+	end
+
+	-- Trace function invocations to resolve field types
+	for i = 1, lineCount do
+		local lineText = getLineSafe(document, i)
+		if lineText then
+			lineText = string.gsub(lineText, "[\r\n]+$", "")
+			for funcName, info in pairs(functions) do
+				if i == info.lineNum then continue end
+
+				local argExpr = string.match(lineText, funcName .. "%s*%((.-)%)")
+				if argExpr then
+					for fieldName, fieldExpr in string.gmatch(argExpr, "([%a_][%w_]*)%s*=%s*([^,}]+)") do
+						local fName = trim(fieldName) :: string
+						local fExpr = trim(fieldExpr) :: string
+						local resolvedType = resolveExpressionType(document, fExpr, i, tables) or "any"
+						info.fields[fName] = info.fields[fName] or {}
+						info.fields[fName][resolvedType] = true
+					end
+				end
+			end
+		end
+	end
+
+	-- Apply upgrades to function declarations
+	for funcName, info in pairs(functions) do
+		local fieldsList = {}
+		for fieldName, typeMap in pairs(info.fields) do
+			local fieldType = buildUnionType(typeMap)
+			table.insert(fieldsList, string.format("%s: %s", fieldName, fieldType))
+		end
+		table.sort(fieldsList)
+
+		local finalType = "{ " .. table.concat(fieldsList, ", ") .. " }"
+		if #fieldsList > 0 and info.rawParamType ~= finalType then
+			local expectedLine = string.format("local function %s(%s: %s)", funcName, info.paramName, finalType)
+			local indent: string = (string.match(info.rawLine, "^(%s*)") or "") :: string
+			expectedLine = indent .. expectedLine
+			if info.rawLine ~= expectedLine then
+				isApplyingEdit = true
+				local syncOk = pcall(function()
+					document:EditTextAsync(expectedLine, info.lineNum, 1, info.lineNum, #info.rawLine + 1)
+				end)
+				isApplyingEdit = false
+				if syncOk then
+					recordSelfEdit(document, info.lineNum, expectedLine)
+					logStatus("[PrettierAI Offline-Sync] Instantly upgraded function '" .. funcName .. "' parameters from edits.")
+				end
 			end
 		end
 	end
@@ -1622,6 +1737,7 @@ local function formatScript()
 				return
 			end
 
+			resultLines = preserveIndentation(originalLines, resultLines)
 			local finalText = table.concat(resultLines, "\n")
 
 			local origRound, origSquare, origCurly = bracketBalance(sourceSnapshot)
@@ -1841,4 +1957,3 @@ formatLineAction.Triggered:Connect(formatLine)
 
 formatScriptUIBtn.MouseButton1Click:Connect(formatScript)
 formatScriptAction.Triggered:Connect(formatScript)
-
